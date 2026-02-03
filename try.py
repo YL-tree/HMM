@@ -276,7 +276,9 @@ def diagnose_log_bk(log_bk):
 # Training
 # ---------------------------------------------------------
 def train_experiment():
-    DATA_FILE = "hmm_mnist_data.pt"
+    # DATA_FILE = "hmm_mnist_data.pt"
+    DATA_FILE = "hmm_mnist_10_class.pt"
+
     if not os.path.exists(DATA_FILE):
         print("Data file not found.")
         return
@@ -298,16 +300,16 @@ def train_experiment():
     # - 太大 (如 32): z 能编码类别信息，x 被忽略
     # - 太小 (如 2): z 容量不足，重建质量差，可能退化到全黑/全白
     # - 推荐: 8-16 配合高 beta_kl
-    LATENT_DIM = 8
+    LATENT_DIM = 12
 
     # beta_kl: KL 散度权重 (β-VAE 思想)
     # - 高 beta (如 10-50): 强迫 z → N(0,I)，减少 z 携带的信息
     # - 这迫使模型依赖 x 来区分类别
-    BETA_KL = 20.0
+    BETA_KL = 25.0
 
     # scale_factor: log_bk 的缩放因子
     # - 控制 Gumbel softmax 的 logits 范围
-    SCALE_FACTOR = 60.0
+    SCALE_FACTOR = 50.0
 
     LR = 5e-4
     HMM_LR = 5e-3

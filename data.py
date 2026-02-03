@@ -116,6 +116,46 @@ def visualize_sequence(sequence, states, save_path="sample_seq.png"):
     print(f"Visualization saved to {save_path}")
     plt.close()
 
+def visualize_decoder_control(model, device, epoch):
+    """
+    画图验证：固定 z，改变 x，看图片是否变化。
+    如果每一行的图片随着列变化而变化，说明 FiLM 生效了。
+    """
+    model.eval()
+    K = model.K
+    latent_dim = model.vae.latent_dim
+    n_samples = 5
+    
+    # 随机采样几个 z (Fixed style)
+    z_fixed = torch.randn(n_samples, latent_dim).to(device)
+    
+    fig, axes = plt.subplots(n_samples, K, figsize=(K, n_samples))
+    plt.subplots_adjust(wspace=0.05, hspace=0.05)
+    
+    with torch.no_grad():
+        for i in range(n_samples):
+            for k in range(K):
+                # 构造 One-hot x
+                x_input = torch.zeros(1, K).to(device)
+                x_input[0, k] = 1.0
+                
+                # Decode: Fixed z[i] + Condition x[k]
+                img = model.vae.decode(z_fixed[i:i+1], x_input)
+                
+                ax = axes[i, k]
+                ax.imshow(img.view(28, 28).cpu(), cmap='gray')
+                ax.axis('off')
+                if i == 0:
+                    ax.set_title(f"S{k}", fontsize=8)
+                if k == 0:
+                    ax.text(-5, 14, f"z_{i}", va='center', fontsize=8)
+    
+    plt.suptitle(f"Decoder Control Check (Epoch {epoch})", fontsize=12)
+    plt.savefig(f"control_check_ep{epoch:03d}.png")
+    plt.close()
+    print(f"Saved control_check_ep{epoch:03d}.png (Check this to see if x controls output!)")
+
+
 if __name__ == "__main__":
     # # ================= 配置参数 =================
     # SAVE_FILE = "hmm_mnist_data.pt"
@@ -133,11 +173,11 @@ if __name__ == "__main__":
     #     [0.90, 0.05, 0.05]  # 2 大概率变成 0
     # ])
     # ================= 配置参数 =================
-    SAVE_FILE = "hmm_mnist_5_class.pt"
-    NUM_SEQS = 1000
-    SEQ_LEN = 16          # 序列稍微长一点，让模型看清更多转移
-    DIGITS = list(range(5)) # [0, 1, ..., 4]
-    K = 5
+    SAVE_FILE = "hmm_mnist_10_class.pt"
+    NUM_SEQS = 5000
+    SEQ_LEN = 32          # 序列稍微长一点，让模型看清更多转移
+    DIGITS = list(range(10)) # [0, 1, ..., 4]
+    K = 10
 
     # 构造 10x10 的循环矩阵
     # 0->1, 1->2, ..., 9->0
