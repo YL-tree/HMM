@@ -71,7 +71,12 @@ class HMM_VAE(nn.Module):
 
         # HMM parameters
         self.log_pi = nn.Parameter(torch.zeros(K))
-        self.log_A = nn.Parameter(torch.randn(K, K) * 0.1)
+        # self.log_A = nn.Parameter(torch.randn(K, K) * 0.1)
+
+        init_log_A = torch.randn(K, K) * 0.1  # 保持一点点随机性
+        with torch.no_grad():
+            init_log_A.fill_diagonal_(1.0)    # 强力加强对角线
+        self.log_A = nn.Parameter(init_log_A)
 
     def get_hmm_params(self):
         pi = torch.softmax(self.log_pi, dim=0)
@@ -105,7 +110,14 @@ class HMM_VAE(nn.Module):
                 reduction='none'
             ).sum(1)
 
-            log_bk.append((-bce / scale_factor).view(B, T))
+            # [修改] 增加一个 Tanh 或 Clamp 来物理限制数值范围
+        # 这样 Gap 永远不可能超过某个阈值 (比如 10)
+        # 这里的 10.0 是一个硬上限，防止模型过度自信
+            log_prob = -bce / scale_factor
+            log_prob = 10.0 * torch.tanh(log_prob / 10.0) 
+        
+            log_bk.append(log_prob.view(B, T))
+            # log_bk.append((-bce / scale_factor).view(B, T))
 
         log_bk = torch.stack(log_bk, dim=2)
         return log_bk, z, mu, logvar
@@ -279,7 +291,7 @@ def train_experiment():
     # ========================================
     # 关键超参数
     # ========================================
-    BATCH_SIZE = 64
+    BATCH_SIZE = 256
     EPOCHS = 100
 
     # latent_dim: 控制 z 的信息容量
@@ -295,31 +307,34 @@ def train_experiment():
 
     # scale_factor: log_bk 的缩放因子
     # - 控制 Gumbel softmax 的 logits 范围
-    SCALE_FACTOR = 50.0
+    SCALE_FACTOR = 60.0
 
     LR = 5e-4
-    # HMM_LR = 5e-4
-    # VAE_LR = 5e-4
+    HMM_LR = 5e-3
+    VAE_LR = 5e-4
     TAU_START = 1.5
     TAU_MIN = 0.3
-
+    
     # ========================================
 
     dataset = TensorDataset(sequences)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     model = HMM_VAE(K, LATENT_DIM, device=DEVICE).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LR)
-    # # 分离参数组
-    # hmm_params = [model.log_A, model.log_pi]
-    # vae_params = [p for n, p in model.named_parameters() if 'log_A' not in n and 'log_pi' not in n]
+    # optimizer = optim.Adam(model.parameters(), lr=LR)
+    # 分离参数组
+    hmm_params = [model.log_A, model.log_pi]
+    vae_params = [p for n, p in model.named_parameters() if 'log_A' not in n and 'log_pi' not in n]
 
-    # # [修改] 给 HMM 10倍~20倍的学习率
-    # optimizer = optim.Adam([
-    #     {'params': vae_params, 'lr': VAE_LR},       # VAE 保持慢稳
-    #     {'params': hmm_params, 'lr': HMM_LR}        # HMM 加速冲刺
-    # ])
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
+    # [修改] 给 HMM 10倍~20倍的学习率
+    optimizer = optim.Adam([
+        {'params': vae_params, 'lr': VAE_LR},       # VAE 保持慢稳
+        {'params': hmm_params, 'lr': HMM_LR}        # HMM 加速冲刺
+    ])
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=10, verbose=True
+    )
 
     print(f"Config: latent_dim={LATENT_DIM}, beta_kl={BETA_KL}, scale={SCALE_FACTOR}")
     print("="*60)
@@ -329,7 +344,8 @@ def train_experiment():
 
     for epoch in range(EPOCHS):
         # Temperature annealing
-        tau = max(TAU_MIN, TAU_START * (0.97 ** epoch))
+        # tau = max(TAU_MIN, TAU_START * (0.97 ** epoch))
+        tau = max(TAU_MIN, TAU_START * (0.985 ** epoch))
 
         total_loss = 0
         total_emit = 0
@@ -388,13 +404,14 @@ def train_experiment():
             total_trans += loss_transition.item()
             total_kl += kld.item()
 
-        scheduler.step()
+        
 
         avg_loss = total_loss / len(loader)
         avg_emit = total_emit / len(loader)
         avg_trans = total_trans / len(loader)
         avg_kl = total_kl / len(loader)
         avg_gap = np.mean(all_gaps)
+        scheduler.step(avg_loss)
 
         # Evaluate
         with torch.no_grad():
