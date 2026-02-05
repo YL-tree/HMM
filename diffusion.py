@@ -118,8 +118,8 @@ class ConditionalUNet(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
 
-        # Encoder
-        self.enc1 = self._conv_block(1, 32)
+        # Encoder: 输入通道 = 1 (image) + K (condition broadcast)
+        self.enc1 = self._conv_block(1 + K, 32)
         self.film_enc1 = nn.Linear(cond_dim, 32 * 2)   # scale + shift
         self.pool1 = nn.Conv2d(32, 32, 3, 2, 1)    # 28→14
 
@@ -166,7 +166,12 @@ class ConditionalUNet(nn.Module):
         cond = torch.cat([t_emb, x_emb], dim=1)  # [N, cond_dim]
 
         # Encoder (每层都注入条件)
-        e1 = self.enc1(y_noisy)
+        # 输入拼接: x_state [N,K] → [N,K,H,W] 和 y_noisy 拼接
+        H, W = y_noisy.size(2), y_noisy.size(3)
+        x_map = x_state[:, :, None, None].expand(-1, -1, H, W)
+        inp = torch.cat([y_noisy, x_map], dim=1)  # [N, 1+K, H, W]
+
+        e1 = self.enc1(inp)
         e1 = self._apply_film(e1, self.film_enc1, cond)
 
         e2 = self.enc2(self.pool1(e1))
@@ -268,6 +273,41 @@ class HMM_Diffusion(nn.Module):
         y_noisy, _ = self.q_sample(y_flat, t, noise)
         noise_pred = self.denoiser(y_noisy, t, x_state)
         return F.mse_loss(noise_pred, noise)
+
+    def compute_contrastive_loss(self, y_flat, x_state):
+        """
+        对比 loss: 鼓励正确条件的 MSE 低于随机错误条件的 MSE
+        - 正确条件: noise_pred_pos = denoiser(y_noisy, t, x_correct)
+        - 错误条件: noise_pred_neg = denoiser(y_noisy, t, x_random_wrong)
+        - loss = max(0, MSE_pos - MSE_neg + margin)
+        """
+        N = y_flat.size(0)
+        t = torch.randint(0, self.num_timesteps, (N,), device=self.device)
+        noise = torch.randn_like(y_flat)
+        y_noisy, _ = self.q_sample(y_flat, t, noise)
+
+        # 正确条件
+        noise_pred_pos = self.denoiser(y_noisy, t, x_state)
+        mse_pos = (noise_pred_pos - noise).pow(2).view(N, -1).mean(1)  # [N]
+
+        # 错误条件: 随机 shuffle 条件
+        perm = torch.randperm(N, device=self.device)
+        x_neg = x_state[perm]
+        # 确保 x_neg != x_state (如果碰巧一样就再 shuffle)
+        same = (x_neg.argmax(1) == x_state.argmax(1))
+        while same.any():
+            perm2 = torch.randperm(same.sum().item(), device=self.device)
+            x_neg[same] = x_neg[same][perm2]
+            same = (x_neg.argmax(1) == x_state.argmax(1))
+
+        noise_pred_neg = self.denoiser(y_noisy, t, x_neg)
+        mse_neg = (noise_pred_neg - noise).pow(2).view(N, -1).mean(1)  # [N]
+
+        # Triplet margin loss: MSE_pos should be lower than MSE_neg by margin
+        margin = 0.01
+        contrastive = F.relu(mse_pos - mse_neg + margin).mean()
+
+        return contrastive
 
     @torch.no_grad()
     def sample(self, x_state, n_samples=1):
