@@ -237,24 +237,24 @@ class HMM_Diffusion(nn.Module):
         log b_k(y) — 全部 no_grad
         对 n_mc 个随机时间步采样取平均, 近似条件对数似然
         
-        改进: 只采样 t ∈ [0, t_max) 的低噪声时间步, 提高判别信噪比
-        低 t: 噪声少, 不同 k 的预测差异大 → 判别信号强
-        高 t: 噪声大, 所有 k 的预测趋于相同 → 只是噪声
+        采样中间段时间步 t ∈ [t_lo, t_hi):
+        - 极低 t: y_noisy ≈ y, denoiser 不需要条件就能预测, 差异小
+        - 中等 t: 图像被部分破坏, denoiser 必须依赖条件, 差异最大
+        - 极高 t: y_noisy ≈ 纯噪声, 任何条件都没用, 差异小
         """
         B, T_seq, C, H, W = y_batch.size()
         y_flat = y_batch.view(B * T_seq, C, H, W)
         N = B * T_seq
         scale = torch.exp(self.log_scale)
         
-        # 关键改进: 只采样低噪声时间步 (t < t_max)
-        # 低 t: 噪声少, 不同 k 的预测差异大 → 判别信号强
-        # 高 t: 噪声大, 所有 k 的预测趋于相同 → 只是噪声
-        t_max = self.num_timesteps // 2  # 只用前一半时间步
+        # 中间段: 噪声够大让 denoiser 依赖条件, 又没大到无法区分
+        t_lo = self.num_timesteps // 5       # 20
+        t_hi = self.num_timesteps * 3 // 5   # 60
 
         total_mse = torch.zeros(self.K, N, device=self.device)
 
         for _ in range(n_mc):
-            t = torch.randint(0, t_max, (N,), device=self.device)
+            t = torch.randint(t_lo, t_hi, (N,), device=self.device)
             noise = torch.randn_like(y_flat)
             y_noisy, _ = self.q_sample(y_flat, t, noise)
 
@@ -771,6 +771,36 @@ def train_experiment():
             acc = np.mean(aligned == ts)
             diag_str += f" | Acc={acc:.3f}"
         print(diag_str)
+
+        # --- R1 结束后: 诊断不同 t 范围的 MSE 差异 ---
+        if em_round == 0:
+            print("\n  [Diagnostic] MSE gap across timestep ranges:")
+            model.eval()
+            diag_y = sequences[:100].to(DEVICE)
+            diag_flat = diag_y.view(-1, 1, 28, 28)
+            N_diag = diag_flat.size(0)
+            with torch.no_grad():
+                for t_lo_d, t_hi_d in [(0,20), (20,40), (40,60), (60,80), (80,100)]:
+                    mse_per_k = torch.zeros(K, N_diag, device=DEVICE)
+                    for _ in range(8):
+                        t_d = torch.randint(t_lo_d, t_hi_d, (N_diag,), device=DEVICE)
+                        noise_d = torch.randn_like(diag_flat)
+                        y_noisy_d, _ = model.q_sample(diag_flat, t_d, noise_d)
+                        for k in range(K):
+                            x_k_d = torch.zeros(N_diag, K, device=DEVICE)
+                            x_k_d[:, k] = 1.0
+                            pred_d = model.denoiser(y_noisy_d, t_d, x_k_d)
+                            mse_d = (pred_d - noise_d).pow(2).view(N_diag, -1).mean(1)
+                            mse_per_k[k] += mse_d
+                    mse_per_k /= 8
+                    # 每个样本: best_k 和 worst_k 的 MSE 差
+                    mse_min = mse_per_k.min(dim=0)[0]
+                    mse_max = mse_per_k.max(dim=0)[0]
+                    diff = (mse_max - mse_min).mean().item()
+                    avg_mse_val = mse_per_k.mean().item()
+                    print(f"    t=[{t_lo_d:3d},{t_hi_d:3d}): avg_mse={avg_mse_val:.4f} | "
+                          f"max-min_diff={diff:.5f} | ratio={diff/avg_mse_val:.5f}")
+            model.train()
 
     # 保存预训练 checkpoint
     print(f"\n>> Pretrain done. Saving to {PRETRAIN_PATH}...")
