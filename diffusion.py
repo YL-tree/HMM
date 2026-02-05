@@ -237,19 +237,24 @@ class HMM_Diffusion(nn.Module):
         log b_k(y) — 全部 no_grad
         对 n_mc 个随机时间步采样取平均, 近似条件对数似然
         
-        注意: MSE 用 mean (每像素平均) 而非 sum,
-        这样数值量级 ~0.5-1.0, scale_factor 更容易调节
+        改进: 只采样 t ∈ [0, t_max) 的低噪声时间步, 提高判别信噪比
+        低 t: 噪声少, 不同 k 的预测差异大 → 判别信号强
+        高 t: 噪声大, 所有 k 的预测趋于相同 → 只是噪声
         """
         B, T_seq, C, H, W = y_batch.size()
         y_flat = y_batch.view(B * T_seq, C, H, W)
         N = B * T_seq
-        n_pixels = C * H * W  # 784
         scale = torch.exp(self.log_scale)
+        
+        # 关键改进: 只采样低噪声时间步 (t < t_max)
+        # 低 t: 噪声少, 不同 k 的预测差异大 → 判别信号强
+        # 高 t: 噪声大, 所有 k 的预测趋于相同 → 只是噪声
+        t_max = self.num_timesteps // 2  # 只用前一半时间步
 
         total_mse = torch.zeros(self.K, N, device=self.device)
 
         for _ in range(n_mc):
-            t = torch.randint(0, self.num_timesteps, (N,), device=self.device)
+            t = torch.randint(0, t_max, (N,), device=self.device)
             noise = torch.randn_like(y_flat)
             y_noisy, _ = self.q_sample(y_flat, t, noise)
 
@@ -257,10 +262,10 @@ class HMM_Diffusion(nn.Module):
                 x_k = torch.zeros(N, self.K, device=self.device)
                 x_k[:, k] = 1.0
                 noise_pred = self.denoiser(y_noisy, t, x_k)
-                mse = (noise_pred - noise).pow(2).view(N, -1).mean(1)  # 改为 mean
+                mse = (noise_pred - noise).pow(2).view(N, -1).mean(1)
                 total_mse[k] += mse
 
-        avg_mse = total_mse / n_mc  # 量级 ~0.5-1.0
+        avg_mse = total_mse / n_mc
         log_bk = (-avg_mse / scale_factor) * scale
         log_bk = log_bk.t().view(B, T_seq, self.K)
         return log_bk
@@ -544,8 +549,8 @@ def train_experiment():
     TAU_START = 2.0
     TAU_MIN = 0.1
 
-    N_MC_ESTEP = 8              # E-step MC 采样数
-    N_MC_LOG_BK = 4             # HMM 阶段每 batch MC 采样数
+    N_MC_ESTEP = 16             # E-step MC 采样数 (no_grad, 可以多一些)
+    N_MC_LOG_BK = 8             # HMM 阶段每 batch MC 采样数
     REASSIGN_BATCH = 128
 
     # ==========================================
@@ -553,14 +558,15 @@ def train_experiment():
     #   E-step: 全局 compute_log_bk → argmax 分配
     #   M-step: 固定分配, 跑 M_EPOCHS 个 epoch 的条件 DDPM
     #   共 N_EM_ROUNDS 轮
+    #   原则: 多轮少步, 频繁校正分配, 避免过拟合到错误分配
     # ==========================================
-    N_EM_ROUNDS = 5             # 5轮EM
-    M_EPOCHS = 15               # 每轮15个epoch
-    # 总预训练 = 5 * 15 = 75
+    N_EM_ROUNDS = 8             # 多轮 EM, 频繁校正
+    M_EPOCHS = 5                # 每轮少训练, 避免过拟合错误分配
+    # 总预训练 = 8 * 5 = 40
 
-    PRETRAIN_TOTAL = N_EM_ROUNDS * M_EPOCHS  # 75
-    HMM_WARMUP_END = PRETRAIN_TOTAL + 50     # 125
-    TOTAL_EPOCHS = PRETRAIN_TOTAL + 100      # 175
+    PRETRAIN_TOTAL = N_EM_ROUNDS * M_EPOCHS  # 40
+    HMM_WARMUP_END = PRETRAIN_TOTAL + 50     # 90
+    TOTAL_EPOCHS = PRETRAIN_TOTAL + 100      # 140
 
     LOAD_PRETRAINED = False
     PRETRAIN_PATH = "checkpoint_pretrain_diffusion.pt"
