@@ -237,19 +237,18 @@ class HMM_Diffusion(nn.Module):
         log b_k(y) — 全部 no_grad
         对 n_mc 个随机时间步采样取平均, 近似条件对数似然
         
-        采样中间段时间步 t ∈ [t_lo, t_hi):
-        - 极低 t: y_noisy ≈ y, denoiser 不需要条件就能预测, 差异小
-        - 中等 t: 图像被部分破坏, denoiser 必须依赖条件, 差异最大
-        - 极高 t: y_noisy ≈ 纯噪声, 任何条件都没用, 差异小
+        诊断发现: 高 t 时刻 ratio(max-min_diff / avg_mse) 最大
+        因为图像被噪声完全破坏后, denoiser 必须依赖条件 k
+        t=[60,100): diff=0.01, ratio=34-45%, 信号最强
         """
         B, T_seq, C, H, W = y_batch.size()
         y_flat = y_batch.view(B * T_seq, C, H, W)
         N = B * T_seq
         scale = torch.exp(self.log_scale)
         
-        # 中间段: 噪声够大让 denoiser 依赖条件, 又没大到无法区分
-        t_lo = self.num_timesteps // 5       # 20
-        t_hi = self.num_timesteps * 3 // 5   # 60
+        # 高噪声段: denoiser 被迫依赖条件, 区分度最大
+        t_lo = self.num_timesteps * 3 // 5   # 60
+        t_hi = self.num_timesteps             # 100
 
         total_mse = torch.zeros(self.K, N, device=self.device)
 
@@ -271,9 +270,18 @@ class HMM_Diffusion(nn.Module):
         return log_bk
 
     def compute_diffusion_loss(self, y_flat, x_state):
-        """标准 DDPM loss (有梯度, 单次 forward)"""
+        """
+        DDPM loss, 偏向高 t 采样以强化条件依赖
+        
+        标准 DDPM 均匀采样 t, denoiser 在低 t 不需要条件就能预测
+        偏向高 t 后, denoiser 被迫更多依赖条件输入
+        使用 beta 分布偏向高 t, 同时保留低 t 的覆盖
+        """
         N = y_flat.size(0)
-        t = torch.randint(0, self.num_timesteps, (N,), device=self.device)
+        # 用均匀分布的平方偏向高 t: u~U(0,1), t = u^0.5 * T
+        # 这样 t 的分布密度在高 t 端更高
+        u = torch.rand(N, device=self.device)
+        t = (u.sqrt() * self.num_timesteps).long().clamp(0, self.num_timesteps - 1)
         noise = torch.randn_like(y_flat)
         y_noisy, _ = self.q_sample(y_flat, t, noise)
         noise_pred = self.denoiser(y_noisy, t, x_state)
