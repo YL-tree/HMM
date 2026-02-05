@@ -556,17 +556,18 @@ def train_experiment():
     # ==========================================
     # 严格 EM 预训练: 交替 E-step / M-step
     #   E-step: 全局 compute_log_bk → argmax 分配
-    #   M-step: 固定分配, 跑 M_EPOCHS 个 epoch 的条件 DDPM
-    #   共 N_EM_ROUNDS 轮
-    #   原则: 多轮少步, 频繁校正分配, 避免过拟合到错误分配
+    #   M-step: 固定分配, 跑若干 epoch 的条件 DDPM
+    #   第一轮多训练 (denoiser 从零开始, 需要充分学习 K-means 分配)
+    #   后续轮少训练, 频繁校正, 避免过拟合到错误分配
     # ==========================================
-    N_EM_ROUNDS = 8             # 多轮 EM, 频繁校正
-    M_EPOCHS = 5                # 每轮少训练, 避免过拟合错误分配
-    # 总预训练 = 8 * 5 = 40
+    N_EM_ROUNDS = 8
+    M_EPOCHS_FIRST = 15         # 第一轮: 从零开始, 需要充分训练
+    M_EPOCHS_REST = 5           # 后续轮: 频繁校正
+    # 总预训练 = 15 + 7 * 5 = 50
 
-    PRETRAIN_TOTAL = N_EM_ROUNDS * M_EPOCHS  # 40
-    HMM_WARMUP_END = PRETRAIN_TOTAL + 50     # 90
-    TOTAL_EPOCHS = PRETRAIN_TOTAL + 100      # 140
+    PRETRAIN_TOTAL = M_EPOCHS_FIRST + (N_EM_ROUNDS - 1) * M_EPOCHS_REST  # 50
+    HMM_WARMUP_END = PRETRAIN_TOTAL + 50     # 100
+    TOTAL_EPOCHS = PRETRAIN_TOTAL + 100      # 150
 
     LOAD_PRETRAINED = False
     PRETRAIN_PATH = "checkpoint_pretrain_diffusion.pt"
@@ -643,7 +644,7 @@ def train_experiment():
     # 辅助函数: E-step (全局重算分配)
     # ==========================================
     def do_estep(scale_factor):
-        """E-step: 全局重算分配 (n_mc=32 低方差)"""
+        """E-step: 全局重算分配, 返回 (assignments, gap, n_used, freq, all_log_bk)"""
         model.eval()
         reassign_loader = DataLoader(
             TensorDataset(sequences, indices_tensor),
@@ -664,15 +665,15 @@ def train_experiment():
         freq = torch.bincount(assignments.view(-1), minlength=K).float()
         freq = freq / freq.sum()
         model.train()
-        return assignments, gap, n_used, freq.numpy()
+        return assignments, gap, n_used, freq.numpy(), all_log_bk
 
     # ==========================================
     # Phase 1: 严格 EM 预训练
     # ==========================================
+    global_epoch = 0
     for em_round in range(N_EM_ROUNDS):
-        # scale_factor 固定 (MSE 用 mean, 量级~0.6, 差异~0.01)
-        # sf=0.01 → log_bk 差异 ~1.0, 合理
         sf = 0.01
+        cur_m_epochs = M_EPOCHS_FIRST if em_round == 0 else M_EPOCHS_REST
 
         # --- E-step ---
         print(f"\n{'='*60}")
@@ -688,16 +689,33 @@ def train_experiment():
             print(f"  [Skip E-step, using K-means init]")
             print(f"  #st={n_used} | freq=[{freq_np.min():.3f}-{freq_np.max():.3f}]")
         else:
-            # Round 2+: 保守更新分配 (只更新高置信度部分)
-            cached_assignments, gap, n_used, freq_np = do_estep(sf)
-            print(f"  Gap={gap:.4f} | #st={n_used} | "
-                  f"freq=[{freq_np.min():.3f}-{freq_np.max():.3f}]")
+            # Round 2+: 保守更新 — 只更新高置信度的样本, 保护已有分配
+            new_assignments, gap, n_used, freq_np, all_log_bk_tmp = do_estep(sf)
 
-        # --- M-step: 跑 M_EPOCHS 个 epoch ---
-        print(f"  M-step: training {M_EPOCHS} epochs with fixed assignments...")
-        for m_ep in range(M_EPOCHS):
-            epoch = em_round * M_EPOCHS + m_ep
-            if epoch < start_epoch:
+            # 每个样本的置信度 = top1 - top2 gap
+            vals_tmp, _ = torch.topk(all_log_bk_tmp, 2, dim=2)
+            per_sample_gap = vals_tmp[:, :, 0] - vals_tmp[:, :, 1]  # [num_seq, seq_len]
+
+            # 只更新 gap > median 的样本
+            median_gap = per_sample_gap.median().item()
+            confident_mask = (per_sample_gap > median_gap)
+            update_ratio = confident_mask.float().mean().item()
+            cached_assignments[confident_mask] = new_assignments[confident_mask]
+
+            # 重算更新后的统计
+            freq_t = torch.bincount(cached_assignments.view(-1), minlength=K).float()
+            freq_np = (freq_t / freq_t.sum()).numpy()
+            n_used = len(cached_assignments.unique())
+
+            print(f"  Gap={gap:.4f} | #st={n_used} | "
+                  f"freq=[{freq_np.min():.3f}-{freq_np.max():.3f}] | "
+                  f"updated={update_ratio:.1%} (threshold={median_gap:.4f})")
+
+        # --- M-step: 跑 cur_m_epochs 个 epoch ---
+        print(f"  M-step: training {cur_m_epochs} epochs with fixed assignments...")
+        for m_ep in range(cur_m_epochs):
+            if global_epoch < start_epoch:
+                global_epoch += 1
                 continue
 
             optimizer.param_groups[0]['lr'] = 2e-4
@@ -729,17 +747,16 @@ def train_experiment():
                 if err < best_err:
                     best_err = err
 
-            # 只打印每轮的第1个和最后1个epoch，中间省略
-            if m_ep == 0 or m_ep == M_EPOCHS - 1:
-                print(f"  Ep {epoch:03d} [EM-R{em_round+1} M{m_ep+1:02d}] | "
+            if m_ep == 0 or m_ep == cur_m_epochs - 1:
+                print(f"  Ep {global_epoch:03d} [EM-R{em_round+1} M{m_ep+1:02d}] | "
                       f"Loss {avg_loss:.4f} | A_err {err:.4f} (best {best_err:.4f}) | sf={sf}")
+            global_epoch += 1
 
         # --- 每个 Round 结束后: 画图 + 评估 ---
-        visualize_decoder_control(model, DEVICE, epoch)
-        eval_assign, gap_after, n_used_after, freq_after = do_estep(sf)
+        visualize_decoder_control(model, DEVICE, global_epoch - 1)
+        eval_assign, gap_after, n_used_after, freq_after, _ = do_estep(sf)
         diag_str = (f"  >> After R{em_round+1}: Gap={gap_after:.4f} | #st={n_used_after} | "
                     f"freq=[{freq_after.min():.3f}-{freq_after.max():.3f}]")
-        # 如果有真实标签，算对齐后的准确率
         if true_states is not None:
             cost = np.zeros((K, K))
             ea = eval_assign.view(-1).numpy()
@@ -760,7 +777,7 @@ def train_experiment():
     torch.save(model.state_dict(), PRETRAIN_PATH)
 
     # 最终 E-step 评估
-    final_assign, final_gap, final_n_used, final_freq = do_estep(0.01)
+    final_assign, final_gap, final_n_used, final_freq, _ = do_estep(0.01)
     print(f">> Final pretrain: Gap={final_gap:.4f} | #st={final_n_used}")
     if final_gap < 1.0:
         print(f">> WARNING: Gap={final_gap:.4f} < 1.0, 预训练可能不充分!")
